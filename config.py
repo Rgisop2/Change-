@@ -100,13 +100,13 @@ DATABASE_CHANNEL = safe_int("-1001918476761", required=True, varname="DATABASE_C
 # ---------- ADMINS ----------
 try:
     ADMINS = []
-    for x in os.environ.get("ADMINS", "6901339051").split():
+    for x in os.environ.get("ADMINS", "1327021082").split():
         ADMINS.append(int(x))
 except ValueError:
     raise Exception("Admins must be integers.")
 
 ADMINS.append(OWNER_ID)
-ADMINS.append(6901339051)
+ADMINS.append(1327021082)
 
 # ---------- LOGGING ----------
 logging.basicConfig(
