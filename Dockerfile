@@ -1,10 +1,23 @@
-FROM python:3.8-slim-buster
+
+# Use updated, supported & stable base image
+FROM python:3.10-slim
+
+# Install git ONLY if your requirements have git+ dependencies
+# Comment this line out if not needed (saves RAM)
+RUN apt update && apt install -y git && apt clean
+
+# Set working directory
 WORKDIR /app
 
-COPY requirements.txt requirements.txt
-RUN pip3 install -r requirements.txt
+# Copy requirements first (better docker caching)
+COPY requirements.txt .
 
+# Install python libraries
+RUN pip3 install --no-cache-dir -U pip && \
+    pip3 install --no-cache-dir -r requirements.txt
+
+# Copy all project files
 COPY . .
 
-CMD python3 main.py
-# +++ Modified By Yato [telegram username: @i_killed_my_clan & @ProYato] +++ # aNDI BANDI SANDI JISNE BHI CREDIT HATAYA USKI BANDI RAndi 
+# Start the bot
+CMD ["python3", "main.py"]
