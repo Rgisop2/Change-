@@ -24,7 +24,7 @@ APP_ID = safe_int(os.environ.get("APP_ID", "23715627"), required=True, varname="
 API_HASH = os.environ.get("API_HASH", "26c335fe953856eb72845e02c6c44930")
 
 # ---------- MAIN ----------
-OWNER_ID = safe_int(os.environ.get("OWNER_ID", "6901339051"), required=True, varname="OWNER_ID")
+OWNER_ID = safe_int(os.environ.get("OWNER_ID", "1327021082"), required=True, varname="OWNER_ID")
 PORT = safe_int(os.environ.get("PORT", "8080"), default=8080, varname="PORT")
 
 # ---------- DATABASE ----------
