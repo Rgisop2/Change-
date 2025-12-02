@@ -1,69 +1,125 @@
-
-import asyncio
-import base64
-import time
-from asyncio import Lock
-from collections import defaultdict
-from pyrogram import Client, filters
-from pyrogram.enums import ParseMode, ChatMemberStatus, ChatAction
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto
-from pyrogram.errors import FloodWait, UserNotParticipant, UserIsBlocked, InputUserDeactivated
 import os
 import asyncio
-from asyncio import sleep
-from asyncio import Lock
-import random 
+import sys
+import time
+import base64
+from collections import defaultdict
+from pyrogram import Client, filters, __version__
+from pyrogram.enums import ParseMode, ChatMemberStatus, ChatAction
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, User
+from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated, UserNotParticipant, ChatIdInvalid
 
-from bot import Bot
 from datetime import datetime, timedelta
-from config import *
-from database.database import *
-from plugins.newpost import revoke_invite_after_5_minutes
-from helper_func import *
+from config import ADMINS, OWNER_ID
+from helper_func import encode, decode
+from database.database import save_encoded_link, get_channel_by_encoded_link, save_encoded_link2, get_channel_by_encoded_link2
+from database.database import add_user, del_user, full_userbase, present_user, is_admin, get_channel_photo_link, is_user_banned, get_channel_title, save_global_shared_link, save_global_shared_request_link, get_global_shared_link, get_global_shared_request_link
 
-# Create a lock dictionary for each channel to prevent concurrent link generation
-channel_locks = defaultdict(asyncio.Lock)
+#=====================================================================================##
 
-user_banned_until = {}
+def _escape_md_v2(text: str) -> str:
+    # Escape all MDV2 special chars
+    if not text:
+        return text
+    specials = r"_*[]()~`>#+-=|{}.!\\"
+    escaped = ""
+    for ch in text:
+        if ch in specials:
+            escaped += f"\\{ch}"
+        else:
+            escaped += ch
+    return escaped
 
-# Broadcast variables
-cancel_lock = asyncio.Lock()
-is_canceled = False
+def _escape_md_v2_url(url: str) -> str:
+    if not url:
+        return url
+    # In MarkdownV2 link target, escape backslashes and parentheses only
+    return url.replace("\\", "\\\\").replace("(", "\$$").replace(")", "\$$")
 
-@Bot.on_message(filters.command('start') & filters.private)
-async def start_command(client: Bot, message: Message):
+async def refresh_global_links_periodically(client: Client):
+    """Refresh global shared links at 9-minute intervals."""
+    await asyncio.sleep(5)  # Wait for client to initialize
+    while True:
+        try:
+            await asyncio.sleep(540)  # 9 minutes
+            channels = await get_channels()
+            for channel_id in channels:
+                try:
+                    expire_at = datetime.now() + timedelta(minutes=10)
+                    
+                    # Refresh normal link
+                    invite = await client.create_chat_invite_link(
+                        chat_id=channel_id,
+                        expire_date=expire_at,
+                        creates_join_request=False
+                    )
+                    await save_global_shared_link(channel_id, invite.invite_link, expire_at.isoformat())
+                    
+                    # Refresh request link
+                    request_invite = await client.create_chat_invite_link(
+                        chat_id=channel_id,
+                        expire_date=expire_at,
+                        creates_join_request=True
+                    )
+                    await save_global_shared_request_link(channel_id, request_invite.invite_link, expire_at.isoformat())
+                    
+                    print(f"[Refresh] Global links renewed for channel {channel_id}")
+                except Exception as e:
+                    print(f"[Refresh] Error renewing links for {channel_id}: {e}")
+        except Exception as e:
+            print(f"[Refresh] Global link refresh error: {e}")
+
+async def _get_or_create_link(client: Client, channel_id: int, is_request: bool = False) -> str:
+    """Get existing valid link or create new one if expired/missing."""
+    if is_request:
+        existing = await get_global_shared_request_link(channel_id)
+    else:
+        existing = await get_global_shared_link(channel_id)
+    
+    if existing:
+        return existing  # Return existing valid link
+    
+    # Link expired or doesn't exist - create new one
+    try:
+        expire_at = datetime.now() + timedelta(minutes=10)
+        invite = await client.create_chat_invite_link(
+            chat_id=channel_id,
+            expire_date=expire_at,
+            creates_join_request=is_request
+        )
+        expiry_str = expire_at.isoformat()
+        
+        if is_request:
+            await save_global_shared_request_link(channel_id, invite.invite_link, expiry_str)
+        else:
+            await save_global_shared_link(channel_id, invite.invite_link, expiry_str)
+        
+        return invite.invite_link
+    except Exception as e:
+        print(f"[Link] Error creating link for {channel_id}: {e}")
+        return None
+
+@Client.on_message(filters.command('start') & filters.private)
+async def start_command(client: Client, message: Message):
     user_id = message.from_user.id
 
-    if user_id in user_banned_until:
-        if datetime.now() < user_banned_until[user_id]:
-            return await message.reply_text(
-                "<b><blockquote expandable>You are temporarily banned from using commands due to spamming. Try again later.</b>",
-                parse_mode=ParseMode.HTML
-            )
-            
-    await add_user(user_id)
+    # Check if the user is banned
+    if await is_user_banned(user_id):
+        return  # Silently ignore banned users, no response
 
-   # ✅ Check Force Subscription
-    #if not await is_subscribed(client, user_id):
-        #await temp.delete()
-        #return await not_joined(client, message)
-
-# 
-    # Check FSub requirements
-   #  fsub_channels = await get_fsub_channels()
-   #  if fsub_channels:
-    #     is_subscribed, subscription_message, subscription_buttons = await check_subscription_status(client, user_id, fsub_channels)
-   #      if not is_subscribed:
-    #         return await message.reply_text(
-    #             subscription_message,
-    #             reply_markup=subscription_buttons,
-    #             parse_mode=ParseMode.HTML
-     #        )
-
+    # Proceed with the original functionality if the user is not banned
     text = message.text
+    await add_user(user_id)  # Add user to DB
+    
+    placeholder = None
+    try:
+        await client.send_chat_action(message.chat.id, ChatAction.TYPING)
+    except Exception:
+        pass
+
     if len(text) > 7:
         try:
-            base64_string = text.split(" ", 1)[1]
+            base64_string = text.split(" ", 1)[1].strip()
             is_request = base64_string.startswith("req_")
             
             if is_request:
@@ -73,602 +129,200 @@ async def start_command(client: Bot, message: Message):
                 channel_id = await get_channel_by_encoded_link(base64_string)
             
             if not channel_id:
-                return await message.reply_text(
-                    "<b><blockquote expandable>Invalid or expired invite link.</b>",
-                    parse_mode=ParseMode.HTML
-                )
+                if placeholder:
+                    try: await placeholder.delete()
+                    except Exception: pass
+                return await message.reply_text("⚠️ Invalid or expired invite link.")
 
-            # Check if this is a /genlink link (original_link exists)
-            from database.database import get_original_link
-            original_link = await get_original_link(channel_id)
-            if original_link:
-                button = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("• Proceed to Link •", url=original_link)]]
-                )
-                return await message.reply_text(
-                    "<b><blockquote expandable>ʜᴇʀᴇ ɪs ʏᴏᴜʀ ʟɪɴᴋ! ᴄʟɪᴄᴋ ʙᴇʟᴏᴡ ᴛᴏ ᴘʀᴏᴄᴇᴇᴅ</b>",
-                    reply_markup=button,
-                    parse_mode=ParseMode.HTML
-                )
+            invite_link = await _get_or_create_link(client, channel_id, is_request)
+            if not invite_link:
+                return await message.reply_text("⚠️ Unable to generate link. Try again later.")
 
-            # Use a lock for this channel to prevent concurrent link generation
-            async with channel_locks[channel_id]:
-                # Check if we already have a valid link
-                old_link_info = await get_current_invite_link(channel_id)
-                current_time = datetime.now()
-                
-                # If we have an existing link and it's not expired yet (assuming 5 minutes validity)
-                if old_link_info:
-                    link_created_time = await get_link_creation_time(channel_id)
-                    if link_created_time and (current_time - link_created_time).total_seconds() < 240:  # 4 minutes
-                        # Use existing link
-                        invite_link = old_link_info["invite_link"]
-                        is_request_link = old_link_info["is_request"]
-                    else:
-                        # Revoke old link and create new one
-                        try:
-                            await client.revoke_chat_invite_link(channel_id, old_link_info["invite_link"])
-                            print(f"Revoked old {'request' if old_link_info['is_request'] else 'invite'} link for channel {channel_id}")
-                        except Exception as e:
-                            print(f"Failed to revoke old link for channel {channel_id}: {e}")
-                        
-                        # Create new link
-                        invite = await client.create_chat_invite_link(
-                            chat_id=channel_id,
-                            expire_date=current_time + timedelta(minutes=10),
-                            creates_join_request=is_request
-                        )
-                        invite_link = invite.invite_link
-                        is_request_link = is_request
-                        await save_invite_link(channel_id, invite_link, is_request_link)
-                else:
-                    # Create new link
-                    invite = await client.create_chat_invite_link(
-                        chat_id=channel_id,
-                        expire_date=current_time + timedelta(minutes=10),
-                        creates_join_request=is_request
-                    )
-                    invite_link = invite.invite_link
-                    is_request_link = is_request
-                    await save_invite_link(channel_id, invite_link, is_request_link)
-
-            button_text = "• ʀᴇǫᴜᴇsᴛ ᴛᴏ ᴊᴏɪɴ •" if is_request_link else "• ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ •"
+            button_text = "🛎️ Request to Join" if is_request else "🔗 Join Channel"
             button = InlineKeyboardMarkup([[InlineKeyboardButton(button_text, url=invite_link)]])
 
-            wait_msg = await message.reply_text(
-                "⏳",
-                parse_mode=ParseMode.HTML
-            )
-            
-            await wait_msg.delete()
-            
-            await message.reply_text(
-                "<b><blockquote expandable>ʜᴇʀᴇ ɪs ʏᴏᴜʀ ʟɪɴᴋ! ᴄʟɪᴄᴋ ʙᴇʟᴏᴡ ᴛᴏ ᴘʀᴏᴄᴇᴇᴅ</b>",
-                reply_markup=button,
-                parse_mode=ParseMode.HTML
-            )
-
-            note_msg = await message.reply_text(
-                "<u><b>Note: If the link is expired, please click the post link again to get a new one.</b></u>",
-                parse_mode=ParseMode.HTML
-            )
-
-            # Auto-delete the note message after 5 minutes
-            asyncio.create_task(delete_after_delay(note_msg, 300))
-
-            asyncio.create_task(revoke_invite_after_5_minutes(client, channel_id, invite_link, is_request_link))
+            # If a photo_link is available, send a photo with a MarkdownV2 caption; else fallback to text
+            photo_link = await get_channel_photo_link(channel_id)
+            if photo_link:
+                # Fetch channel name or custom title
+                custom_title = await get_channel_title(channel_id)
+                chat = await client.get_chat(channel_id)
+                display_title = custom_title if custom_title else (chat.title or "Channel")
+                channel_handle = f"@{getattr(chat, 'username', None)}" if getattr(chat, "username", None) else display_title
+                
+                # Build caption in MarkdownV2
+                linked_title = "[" + _escape_md_v2("Title'-") + f"]({_escape_md_v2_url(photo_link)})"
+                expire_seconds = 600
+                caption = (
+                    f"{linked_title}{_escape_md_v2(channel_handle)}"
+                    f"{_escape_md_v2('𝖳𝗁𝗂𝗌 𝗅𝗂𝗇𝗄 𝗐𝗂𝗅𝗅 𝖾𝗑𝗉𝗂𝗋𝖾 𝗂𝗇 ')}{_escape_md_v2(str(expire_seconds))}"
+                    f"{_escape_md_v2(' seconds.')}"
+                )
+                try:
+                    await message.reply_photo(
+                        photo=photo_link,
+                        caption=caption,
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=button
+                    )
+                except Exception as e:
+                    print(f"[start] send_photo markdown failed: {e}")
+                    fallback_caption = f"Title'- {channel_handle} This link will expire in 600 seconds."
+                    await message.reply_photo(
+                        photo=photo_link,
+                        caption=fallback_caption,
+                        reply_markup=button
+                    )
+            else:
+                # Fallback to previous text behavior
+                await message.reply_text("Here is your link! Click below to proceed:", reply_markup=button)
 
         except Exception as e:
-            await message.reply_text(
-                "<b><blockquote expandable>Invalid or expired invite link.</b>",
-                parse_mode=ParseMode.HTML
-            )
+            # Ensure placeholder is removed on errors to avoid clutter
+            if placeholder:
+                try: await placeholder.delete()
+                except Exception: pass
+            await message.reply_text("⚠️ Invalid or expired link.")
             print(f"Decoding error: {e}")
     else:
+        # Remove any stray placeholder in no-payload branch
+        if placeholder:
+            try: await placeholder.delete()
+            except Exception: pass
         inline_buttons = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("• ᴀʙᴏᴜᴛ", callback_data="about"),
-                 InlineKeyboardButton("• ᴄʜᴀɴɴᴇʟs", callback_data="channels")],
-                [InlineKeyboardButton("• Close •", callback_data="close")]
+                [InlineKeyboardButton("About Me", callback_data="help"),
+                 InlineKeyboardButton("Close", callback_data="close")]
             ]
         )
         
-        # Show waiting emoji and instantly delete it
-        wait_msg = await message.reply_text("⏳")
-        await asyncio.sleep(0.1)
-        await wait_msg.delete()
+        await message.reply_text(
+            "<b><i>Welcome to the advanced links sharing bot.\nWith this bot, you can share links and keep your channels safe from copyright issues</i></b>",
+            reply_markup=inline_buttons
+        )
         
-        try:
-            await message.reply_photo(
-                photo=START_PIC,
-                caption=START_MSG,
-                reply_markup=inline_buttons,
-                parse_mode=ParseMode.HTML
-            )
-        except Exception as e:
-            print(f"Error sending start picture: {e}")
-            await message.reply_text(
-                START_MSG,
-                reply_markup=inline_buttons,
-                parse_mode=ParseMode.HTML
-            )
+#=====================================================================================##
+
+WAIT_MSG = """"<b>Processing ....</b>"""
+
+REPLY_ERROR = """<code>Use this command as a reply to any telegram message with out any spaces.</code>"""
+
+#=====================================================================================##
+
+@Client.on_message(filters.command('users') & filters.user(OWNER_ID))
+async def get_users(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id != OWNER_ID:
+        return
+    msg = await client.send_message(chat_id=message.chat.id, text=WAIT_MSG)
+    users = await full_userbase()
+    await msg.edit(f"{len(users)} users are using this bot")
 
 
 #=====================================================================================##
-# Don't Remove Credit @CodeFlix_Bots, @rohit_1888
-# Ask Doubt on telegram @CodeflixSupport
 
-async def get_link_creation_time(channel_id):
-    """Get the creation time of the current invite link for a channel."""
-    try:
-        from database.database import channels_collection
-        channel = await channels_collection.find_one({"channel_id": channel_id, "status": "active"})
-        if channel and "invite_link_created_at" in channel:
-            return channel["invite_link_created_at"]
-        return None
-    except Exception as e:
-        print(f"Error fetching link creation time for channel {channel_id}: {e}")
-        return None
+@Client.on_message(filters.private & filters.command('broadcast') & filters.user(OWNER_ID))
+async def send_text(client: Client, message: Message):
+    if message.reply_to_message:
+        query = await full_userbase()
+        broadcast_msg = message.reply_to_message
+        total = 0
+        successful = 0
+        blocked = 0
+        deleted = 0
+        unsuccessful = 0
 
-# Create a global dictionary to store chat data
-chat_data_cache = {}
+        pls_wait = await message.reply("<i>Broadcasting Message.. This will Take Some Time </i>")
+        for chat_id in query:
+            try:
+                await broadcast_msg.copy(chat_id)
+                successful += 1
+            except FloodWait as e:
+                await asyncio.sleep(e.x)
+                await broadcast_msg.copy(chat_id)
+                successful += 1
+            except UserIsBlocked:
+                await del_user(chat_id)
+                blocked += 1
+            except InputUserDeactivated:
+                await del_user(chat_id)
+                deleted += 1
+            except:
+                unsuccessful += 1
+                pass
+            total += 1
 
-async def not_joined(client: Client, message: Message):
-    #temp = await message.reply("<b><i>ᴡᴀɪᴛ ᴀ sᴇᴄ..</i></b>")
+        status = f"""<b><u>Broadcast Completed</u>
 
-    user_id = message.from_user.id
-    buttons = []
-    count = 0
+Total Users: <code>{total}</code>
+Successful: <code>{successful}</code>
+Blocked Users: <code>{blocked}</code>
+Deleted Accounts: <code>{deleted}</code>
+Unsuccessful: <code>{unsuccessful}</code></b>"""
 
-    try:
-        all_channels = await db.show_channels()  # Should return list of (chat_id, mode) tuples
-        for total, chat_id in enumerate(all_channels, start=1):
-            mode = await db.get_channel_mode(chat_id)  # fetch mode 
+        return await pls_wait.edit(status)
 
-            await message.reply_chat_action(ChatAction.TYPING)
+    else:
+        msg = await message.reply(REPLY_ERROR)
+        await asyncio.sleep(8)
+        await msg.delete()
 
-            if not await is_sub(client, user_id, chat_id):
-                try:
-                    # Cache chat info
-                    if chat_id in chat_data_cache:
-                        data = chat_data_cache[chat_id]
-                    else:
-                        data = await client.get_chat(chat_id)
-                        chat_data_cache[chat_id] = data
+#=====================================================================================##
 
-                    name = data.title
+@Client.on_callback_query(filters.regex("help"))
+async def help_callback(client: Client, callback_query):
+    # Define the inline keyboard with the "Close" button
+    inline_buttons = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Close", callback_data="close")]
+        ]
+    )
+    
+    
+    await callback_query.answer()
+    await callback_query.message.edit_text("<b><i>About Us..\n\n‣ Made for : @Anime_X_Hunters\n‣ Owned by : @Okabe_xRintarou\n‣ Developer : @The_Seishiro_Nagi\n\n Adios !!</i></b>", reply_markup=inline_buttons)
 
-                    # Generate proper invite link based on the mode
-                    if mode == "on" and not data.username:
-                        invite = await client.create_chat_invite_link(
-                            chat_id=chat_id,
-                            creates_join_request=True,
-                            expire_date=datetime.utcnow() + timedelta(seconds=FSUB_LINK_EXPIRY) if FSUB_LINK_EXPIRY else None
-                            )
-                        link = invite.invite_link
-
-                    else:
-                        if data.username:
-                            link = f"https://t.me/{data.username}"
-                        else:
-                            invite = await client.create_chat_invite_link(
-                                chat_id=chat_id,
-                                expire_date=datetime.utcnow() + timedelta(seconds=FSUB_LINK_EXPIRY) if FSUB_LINK_EXPIRY else None)
-                            link = invite.invite_link
-
-                    buttons.append([InlineKeyboardButton(text=name, url=link)])
-                    count += 1
-                    #await temp.edit(f"<b>{'! ' * count}</b>")
-
-                except Exception as e:
-                    print(f"Error with chat {chat_id}: {e}")
-                    return #await temp.edit(
-                        #f"<b><i>! Eʀʀᴏʀ, Cᴏɴᴛᴀᴄᴛ ᴅᴇᴠᴇʟᴏᴘᴇʀ ᴛᴏ sᴏʟᴠᴇ ᴛʜᴇ ɪssᴜᴇs @rohit_1888</i></b>\n"
-                        #f"<blockquote expandable><b>Rᴇᴀsᴏɴ:</b> {e}</blockquote>"
-                    #)
-
-        # Retry Button
-        try:
-            buttons.append([
-                InlineKeyboardButton(
-                    text='♻️ Tʀʏ Aɢᴀɪɴ',
-                    url=f"https://t.me/{client.username}?start={message.command[1]}"
-                )
-            ])
-        except IndexError:
-            pass
-
-        await message.reply_photo(
-            photo=FORCE_PIC,
-            caption=FORCE_MSG.format(
-                first=message.from_user.first_name,
-                last=message.from_user.last_name,
-                username=None if not message.from_user.username else '@' + message.from_user.username,
-                mention=message.from_user.mention,
-                id=message.from_user.id
-            ),
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-
-    except Exception as e:
-        print(f"Final Error: {e}")
-
-@Bot.on_callback_query(filters.regex("close"))
-async def close_callback(client: Bot, callback_query):
+@Client.on_callback_query(filters.regex("close"))
+async def close_callback(client: Client, callback_query):
     await callback_query.answer()
     await callback_query.message.delete()
 
-@Bot.on_callback_query(filters.regex("check_sub"))
-async def check_sub_callback(client: Bot, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    fsub_channels = await get_fsub_channels()
-    
-    if not fsub_channels:
-        await callback_query.message.edit_text(
-            "<b>No FSub channels configured!</b>",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    is_subscribed, subscription_message, subscription_buttons = await check_subscription_status(client, user_id, fsub_channels)
-    if is_subscribed:
-        await callback_query.message.edit_text(
-            "<b>You are subscribed to all required channels! Use /start to proceed.</b>",
-            parse_mode=ParseMode.HTML
-        )
-    else:
-        await callback_query.message.edit_text(
-            subscription_message,
-            reply_markup=subscription_buttons,
-            parse_mode=ParseMode.HTML
-        )
+#=====================================================================================##
 
-WAIT_MSG = "<b>Processing...</b>"
-
-REPLY_ERROR = """Usᴇ ᴛʜɪs ᴄᴏᴍᴍᴀɴᴅ ᴀs ᴀ ʀᴇᴘʟʏ ᴛᴏ ᴀɴʏ Tᴇʟᴇɢʀᴀᴍ ᴍᴇssᴀɢᴇ ᴡɪᴛʜᴏᴜᴛ ᴀɴʏ sᴘᴀᴄᴇs."""
-# Define a global variable to store the cancel state
-is_canceled = False
-cancel_lock = Lock()
-
-@Bot.on_message(filters.command('status') & filters.private & is_owner_or_admin)
-async def info(client: Bot, message: Message):   
-    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("• Close •", callback_data="close")]])
-    
-    start_time = time.time()
-    temp_msg = await message.reply("<b><i>Processing...</i></b>", quote=True, parse_mode=ParseMode.HTML)
-    end_time = time.time()
-    
-    ping_time = (end_time - start_time) * 1000
-    
-    users = await full_userbase()
-    now = datetime.now()
-    delta = now - client.uptime
-    bottime = get_readable_time(delta.seconds)
-    
-    await temp_msg.edit(
-        f"<b>Users: {len(users)}\n\nUptime: {bottime}\n\nPing: {ping_time:.2f} ms</b>",
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.HTML
-    )
-
-#--------------------------------------------------------------[[ADMIN COMMANDS]]---------------------------------------------------------------------------#
-# Handler for the /cancel command
-@Bot.on_message(filters.command('cancel') & filters.private & is_owner_or_admin)
-async def cancel_broadcast(client: Bot, message: Message):
-    global is_canceled
-    async with cancel_lock:
-        is_canceled = True
-
-@Bot.on_message(filters.private & filters.command('broadcast') & is_owner_or_admin)
-async def broadcast(client: Bot, message: Message):
-    global is_canceled
-    args = message.text.split()[1:]
-
-    if not message.reply_to_message:
-        msg = await message.reply(
-            "Reply to a message to broadcast.\n\nUsage examples:\n"
-            "`/broadcast normal`\n"
-            "`/broadcast pin`\n"
-            "`/broadcast delete 30`\n"
-            "`/broadcast pin delete 30`\n"
-            "`/broadcast silent`\n"
-        )
-        await asyncio.sleep(8)
-        return await msg.delete()
-
-    # Defaults
-    do_pin = False
-    do_delete = False
-    duration = 0
-    silent = False
-    mode_text = []
-
-    i = 0
-    while i < len(args):
-        arg = args[i].lower()
-        if arg == "pin":
-            do_pin = True
-            mode_text.append("PIN")
-        elif arg == "delete":
-            do_delete = True
-            try:
-                duration = int(args[i + 1])
-                i += 1
-            except (IndexError, ValueError):
-                return await message.reply("<b>Provide valid duration for delete mode.</b>\nUsage: `/broadcast delete 30`")
-            mode_text.append(f"DELETE({duration}s)")
-        elif arg == "silent":
-            silent = True
-            mode_text.append("SILENT")
-        else:
-            mode_text.append(arg.upper())
-        i += 1
-
-    if not mode_text:
-        mode_text.append("NORMAL")
-
-    # Reset cancel flag
-    async with cancel_lock:
-        is_canceled = False
-
-    query = await full_userbase()
-    broadcast_msg = message.reply_to_message
-    total = len(query)
-    successful = blocked = deleted = unsuccessful = 0
-
-    pls_wait = await message.reply(f"<i>Broadcasting in <b>{' + '.join(mode_text)}</b> mode...</i>")
-
-    bar_length = 20
-    progress_bar = ''
-    last_update_percentage = 0
-    update_interval = 0.05  # 5%
-
-    for i, chat_id in enumerate(query, start=1):
-        async with cancel_lock:
-            if is_canceled:
-                await pls_wait.edit(f"›› BROADCAST ({' + '.join(mode_text)}) CANCELED ❌")
-                return
-
-        try:
-            sent_msg = await broadcast_msg.copy(chat_id, disable_notification=silent)
-
-            if do_pin:
-                await client.pin_chat_message(chat_id, sent_msg.id, both_sides=True)
-            if do_delete:
-                asyncio.create_task(auto_delete(sent_msg, duration))
-
-            successful += 1
-        except FloodWait as e:
-            await asyncio.sleep(e.x)
-            try:
-                sent_msg = await broadcast_msg.copy(chat_id, disable_notification=silent)
-                if do_pin:
-                    await client.pin_chat_message(chat_id, sent_msg.id, both_sides=True)
-                if do_delete:
-                    asyncio.create_task(auto_delete(sent_msg, duration))
-                successful += 1
-            except:
-                unsuccessful += 1
-        except UserIsBlocked:
-            await del_user(chat_id)
-            blocked += 1
-        except InputUserDeactivated:
-            await del_user(chat_id)
-            deleted += 1
-        except:
-            unsuccessful += 1
-            await del_user(chat_id)
-
-        # Progress
-        percent_complete = i / total
-        if percent_complete - last_update_percentage >= update_interval or last_update_percentage == 0:
-            num_blocks = int(percent_complete * bar_length)
-            progress_bar = "●" * num_blocks + "○" * (bar_length - num_blocks)
-            status_update = f"""<b>›› BROADCAST ({' + '.join(mode_text)}) IN PROGRESS...
-
-<blockquote>⏳:</b> [{progress_bar}] <code>{percent_complete:.0%}</code></blockquote>
-
-<b>›› Total Users: <code>{total}</code>
-›› Successful: <code>{successful}</code>
-›› Blocked: <code>{blocked}</code>
-›› Deleted: <code>{deleted}</code>
-›› Unsuccessful: <code>{unsuccessful}</code></b>
-
-<i>➪ To stop broadcasting click: <b>/cancel</b></i>"""
-            await pls_wait.edit(status_update)
-            last_update_percentage = percent_complete
-
-    # Final status
-    final_status = f"""<b>›› BROADCAST ({' + '.join(mode_text)}) COMPLETED ✅
-
-<blockquote>Dᴏɴᴇ:</b> [{progress_bar}] {percent_complete:.0%}</blockquote>
-
-<b>›› Total Users: <code>{total}</code>
-›› Successful: <code>{successful}</code>
-›› Blocked: <code>{blocked}</code>
-›› Deleted: <code>{deleted}</code>
-›› Unsuccessful: <code>{unsuccessful}</code></b>"""
-    return await pls_wait.edit(final_status)
-
-
-# helper for delete mode
-async def auto_delete(sent_msg, duration):
-    await asyncio.sleep(duration)
-    try:
-        await sent_msg.delete()
-    except:
-        pass
-
-
-#----------------------------------
 
 user_message_count = {}
 user_banned_until = {}
 
 MAX_MESSAGES = 3
-TIME_WINDOW = timedelta(seconds=10)
-BAN_DURATION = timedelta(hours=1)
+TIME_WINDOW = timedelta(seconds=10)  # Capturing frames
+BAN_DURATION = timedelta(hours=1)  # User ko ban rakhne ka time. hours ko minutes karlena
 
-"""
-
-@Bot.on_message(filters.private)
-async def monitor_messages(client: Bot, message: Message):
+@Client.on_message(filters.private)
+async def monitor_messages(client: Client, message: Message):
     user_id = message.from_user.id
     now = datetime.now()
-
-    if message.text and message.text.startswith("/"):
-        return
 
     if user_id in ADMINS:
         return 
 
+    
     if user_id in user_banned_until and now < user_banned_until[user_id]:
-        await message.reply_text(
-            "<b><blockquote expandable>You are temporarily banned from using commands due to spamming. Try again later.</b>",
-            parse_mode=ParseMode.HTML
-        )
+        await message.reply_text("⚠️ You are temporarily banned from using commands due to spamming. Try again later.")
         return
 
     if user_id not in user_message_count:
         user_message_count[user_id] = []
 
     user_message_count[user_id].append(now)
+
     user_message_count[user_id] = [time for time in user_message_count[user_id] if now - time <= TIME_WINDOW]
 
     if len(user_message_count[user_id]) > MAX_MESSAGES:
         user_banned_until[user_id] = now + BAN_DURATION
-        await message.reply_text(
-            "<b><blockquote expandable>You are temporarily banned from using commands due to spamming. Try again later.</b>",
-            parse_mode=ParseMode.HTML
-        )
+        await message.reply_text("🚫 You have been temporarily banned for spamming. Try again in 1 hour.")
         return
 
-"""
-
-@Bot.on_callback_query()
-async def cb_handler(client: Bot, query: CallbackQuery):
-    data = query.data  
-    chat_id = query.message.chat.id
-    
-    if data == "close":
-        await query.message.delete()
-        try:
-            await query.message.reply_to_message.delete()
-        except:
-            pass
-    
-    elif data == "about":
-        user = await client.get_users(OWNER_ID)
-        user_link = f"https://t.me/{user.username}" if user.username else f"tg://openmessage?user_id={OWNER_ID}"
-        
-        await query.edit_message_media(
-            InputMediaPhoto(
-                "https://envs.sh/Wdj.jpg",
-                ABOUT_TXT
-            ),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton('• ʙᴀᴄᴋ', callback_data='start'), InlineKeyboardButton('ᴄʟᴏsᴇ •', callback_data='close')]
-            ]),
-        )
-
-    elif data == "channels":
-        user = await client.get_users(OWNER_ID)
-        user_link = f"https://t.me/{user.username}" if user.username else f"tg://openmessage?user_id={OWNER_ID}" 
-        ownername = f"<a href={user_link}>{user.first_name}</a>" if user.first_name else f"<a href={user_link}>no name !</a>"
-        await query.edit_message_media(
-            InputMediaPhoto("https://envs.sh/Wdj.jpg", 
-                            CHANNELS_TXT
-            ),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton('• ʙᴀᴄᴋ', callback_data='start'), InlineKeyboardButton('home•', callback_data='setting')]
-            ]),
-        )
-    elif data in ["start", "home"]:
-        inline_buttons = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("• ᴀʙᴏᴜᴛ", callback_data="about"),
-                 InlineKeyboardButton("• ᴄʜᴀɴɴᴇʟs", callback_data="channels")],
-                [InlineKeyboardButton("• Close •", callback_data="close")]
-            ]
-        )
-        try:
-            await query.edit_message_media(
-                InputMediaPhoto(
-                    START_PIC,
-                    START_MSG
-                ),
-                reply_markup=inline_buttons
-            )
-        except Exception as e:
-            print(f"Error sending start/home photo: {e}")
-            await query.edit_message_text(
-                START_MSG,
-                reply_markup=inline_buttons,
-                parse_mode=ParseMode.HTML
-            )
-
-
-    elif data.startswith("rfs_ch_"):
-        cid = int(data.split("_")[2])
-        try:
-            chat = await client.get_chat(cid)
-            mode = await db.get_channel_mode(cid)
-            status = "🟢 ᴏɴ" if mode == "on" else "🔴 ᴏғғ"
-            new_mode = "ᴏғғ" if mode == "on" else "on"
-            buttons = [
-                [InlineKeyboardButton(f"ʀᴇǫ ᴍᴏᴅᴇ {'OFF' if mode == 'on' else 'ON'}", callback_data=f"rfs_toggle_{cid}_{new_mode}")],
-                [InlineKeyboardButton("‹ ʙᴀᴄᴋ", callback_data="fsub_back")]
-            ]
-            await query.message.edit_text(
-                f"Channel: {chat.title}\nCurrent Force-Sub Mode: {status}",
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
-        except Exception:
-            await query.answer("Failed to fetch channel info", show_alert=True)
-
-    elif data.startswith("rfs_toggle_"):
-        cid, action = data.split("_")[2:]
-        cid = int(cid)
-        mode = "on" if action == "on" else "off"
-
-        await db.set_channel_mode(cid, mode)
-        await query.answer(f"Force-Sub set to {'ON' if mode == 'on' else 'OFF'}")
-
-        # Refresh the same channel's mode view
-        chat = await client.get_chat(cid)
-        status = "🟢 ON" if mode == "on" else "🔴 OFF"
-        new_mode = "off" if mode == "on" else "on"
-        buttons = [
-            [InlineKeyboardButton(f"ʀᴇǫ ᴍᴏᴅᴇ {'OFF' if mode == 'on' else 'ON'}", callback_data=f"rfs_toggle_{cid}_{new_mode}")],
-            [InlineKeyboardButton("‹ ʙᴀᴄᴋ", callback_data="fsub_back")]
-        ]
-        await query.message.edit_text(
-            f"Channel: {chat.title}\nCurrent Force-Sub Mode: {status}",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-    elif data == "fsub_back":
-        channels = await db.show_channels()
-        buttons = []
-        for cid in channels:
-            try:
-                chat = await client.get_chat(cid)
-                mode = await db.get_channel_mode(cid)
-                status = "🟢" if mode == "on" else "🔴"
-                buttons.append([InlineKeyboardButton(f"{status} {chat.title}", callback_data=f"rfs_ch_{cid}")])
-            except:
-                continue
-
-        await query.message.edit_text(
-            "sᴇʟᴇᴄᴛ ᴀ ᴄʜᴀɴɴᴇʟ ᴛᴏ ᴛᴏɢɢʟᴇ ɪᴛs ғᴏʀᴄᴇ-sᴜʙ ᴍᴏᴅᴇ:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-def delete_after_delay(msg, delay):
-    async def inner():
-        await asyncio.sleep(delay)
-        try:
-            await msg.delete()
-        except:
-            pass
-    return inner()
+# Function to get channels (dummy implementation)
+async def get_channels():
+    # This should be replaced with actual logic to fetch channels
+    return [123456789, 987654321]
