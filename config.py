@@ -19,7 +19,7 @@ def safe_int(value, default=None, required=False, varname=""):
     return int(value)
 
 # ---------- RECOMMENDED ----------
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8258328792:AAGwI72WIXwCKJNMua-6ZMC0vskl-V809Pc")
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "1666265344:AAFEDY9PNah9_gnowspdm1K4WEzf7mMa2OE")
 APP_ID = safe_int(os.environ.get("APP_ID", "23715627"), required=True, varname="APP_ID")
 API_HASH = os.environ.get("API_HASH", "26c335fe953856eb72845e02c6c44930")
 
