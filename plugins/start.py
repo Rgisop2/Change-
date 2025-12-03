@@ -1,125 +1,55 @@
-import os
+# +++ Modified By Yato [telegram username: @i_killed_my_clan & @ProYato] +++ # aNDI BANDI SANDI JISNE BHI CREDIT HATAYA USKI BANDI RAndi 
 import asyncio
-import sys
-import time
 import base64
+import time
 from collections import defaultdict
-from pyrogram import Client, filters, __version__
+from pyrogram import Client, filters
 from pyrogram.enums import ParseMode, ChatMemberStatus, ChatAction
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, User
-from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated, UserNotParticipant, ChatIdInvalid
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto
+from pyrogram.errors import FloodWait, UserNotParticipant
 
+from bot import Bot
 from datetime import datetime, timedelta
-from config import ADMINS, OWNER_ID
-from helper_func import encode, decode
-from database.database import save_encoded_link, get_channel_by_encoded_link, save_encoded_link2, get_channel_by_encoded_link2
-from database.database import add_user, del_user, full_userbase, present_user, is_admin, get_channel_photo_link, is_user_banned, get_channel_title, save_global_shared_link, save_global_shared_request_link, get_global_shared_link, get_global_shared_request_link
+from config import *
+from database.database import *
+from plugins.newpost import revoke_invite_after_5_minutes
+from helper_func import *
 
-#=====================================================================================##
 
-def _escape_md_v2(text: str) -> str:
-    # Escape all MDV2 special chars
-    if not text:
-        return text
-    specials = r"_*[]()~`>#+-=|{}.!\\"
-    escaped = ""
-    for ch in text:
-        if ch in specials:
-            escaped += f"\\{ch}"
-        else:
-            escaped += ch
-    return escaped
+user_banned_until = {}
 
-def _escape_md_v2_url(url: str) -> str:
-    if not url:
-        return url
-    # In MarkdownV2 link target, escape backslashes and parentheses only
-    return url.replace("\\", "\\\\").replace("(", "\$$").replace(")", "\$$")
+# Broadcast variables
+cancel_lock = asyncio.Lock()
+is_canceled = False
 
-async def refresh_global_links_periodically(client: Client):
-    """Refresh global shared links at 9-minute intervals."""
-    await asyncio.sleep(5)  # Wait for client to initialize
-    while True:
-        try:
-            await asyncio.sleep(540)  # 9 minutes
-            channels = await get_channels()
-            for channel_id in channels:
-                try:
-                    expire_at = datetime.now() + timedelta(minutes=10)
-                    
-                    # Refresh normal link
-                    invite = await client.create_chat_invite_link(
-                        chat_id=channel_id,
-                        expire_date=expire_at,
-                        creates_join_request=False
-                    )
-                    await save_global_shared_link(channel_id, invite.invite_link, expire_at.isoformat())
-                    
-                    # Refresh request link
-                    request_invite = await client.create_chat_invite_link(
-                        chat_id=channel_id,
-                        expire_date=expire_at,
-                        creates_join_request=True
-                    )
-                    await save_global_shared_request_link(channel_id, request_invite.invite_link, expire_at.isoformat())
-                    
-                    print(f"[Refresh] Global links renewed for channel {channel_id}")
-                except Exception as e:
-                    print(f"[Refresh] Error renewing links for {channel_id}: {e}")
-        except Exception as e:
-            print(f"[Refresh] Global link refresh error: {e}")
-
-async def _get_or_create_link(client: Client, channel_id: int, is_request: bool = False) -> str:
-    """Get existing valid link or create new one if expired/missing."""
-    if is_request:
-        existing = await get_global_shared_request_link(channel_id)
-    else:
-        existing = await get_global_shared_link(channel_id)
-    
-    if existing:
-        return existing  # Return existing valid link
-    
-    # Link expired or doesn't exist - create new one
-    try:
-        expire_at = datetime.now() + timedelta(minutes=10)
-        invite = await client.create_chat_invite_link(
-            chat_id=channel_id,
-            expire_date=expire_at,
-            creates_join_request=is_request
-        )
-        expiry_str = expire_at.isoformat()
-        
-        if is_request:
-            await save_global_shared_request_link(channel_id, invite.invite_link, expiry_str)
-        else:
-            await save_global_shared_link(channel_id, invite.invite_link, expiry_str)
-        
-        return invite.invite_link
-    except Exception as e:
-        print(f"[Link] Error creating link for {channel_id}: {e}")
-        return None
-
-@Client.on_message(filters.command('start') & filters.private)
-async def start_command(client: Client, message: Message):
+@Bot.on_message(filters.command('start') & filters.private)
+async def start_command(client: Bot, message: Message):
     user_id = message.from_user.id
 
-    # Check if the user is banned
-    if await is_user_banned(user_id):
-        return  # Silently ignore banned users, no response
+    if user_id in user_banned_until:
+        if datetime.now() < user_banned_until[user_id]:
+            return await message.reply_text(
+                "<b><blockquote expandable>You are temporarily banned from using commands due to spamming. Try again later.</b>",
+                parse_mode=ParseMode.HTML
+            )
+            
+    await add_user(user_id)
+# 
+    # Check FSub requirements
+   #  fsub_channels = await get_fsub_channels()
+   #  if fsub_channels:
+    #     is_subscribed, subscription_message, subscription_buttons = await check_subscription_status(client, user_id, fsub_channels)
+   #      if not is_subscribed:
+    #         return await message.reply_text(
+    #             subscription_message,
+    #             reply_markup=subscription_buttons,
+    #             parse_mode=ParseMode.HTML
+     #        )
 
-    # Proceed with the original functionality if the user is not banned
     text = message.text
-    await add_user(user_id)  # Add user to DB
-    
-    placeholder = None
-    try:
-        await client.send_chat_action(message.chat.id, ChatAction.TYPING)
-    except Exception:
-        pass
-
     if len(text) > 7:
         try:
-            base64_string = text.split(" ", 1)[1].strip()
+            base64_string = text.split(" ", 1)[1]
             is_request = base64_string.startswith("req_")
             
             if is_request:
@@ -129,117 +59,251 @@ async def start_command(client: Client, message: Message):
                 channel_id = await get_channel_by_encoded_link(base64_string)
             
             if not channel_id:
-                if placeholder:
-                    try: await placeholder.delete()
-                    except Exception: pass
-                return await message.reply_text("⚠️ Invalid or expired invite link.")
-
-            invite_link = await _get_or_create_link(client, channel_id, is_request)
-            if not invite_link:
-                return await message.reply_text("⚠️ Unable to generate link. Try again later.")
-
-            button_text = "🛎️ Request to Join" if is_request else "🔗 Join Channel"
-            button = InlineKeyboardMarkup([[InlineKeyboardButton(button_text, url=invite_link)]])
-
-            # If a photo_link is available, send a photo with a MarkdownV2 caption; else fallback to text
-            photo_link = await get_channel_photo_link(channel_id)
-            if photo_link:
-                # Fetch channel name or custom title
-                custom_title = await get_channel_title(channel_id)
-                chat = await client.get_chat(channel_id)
-                display_title = custom_title if custom_title else (chat.title or "Channel")
-                channel_handle = f"@{getattr(chat, 'username', None)}" if getattr(chat, "username", None) else display_title
-                
-                # Build caption in MarkdownV2
-                linked_title = "[" + _escape_md_v2("Title'-") + f"]({_escape_md_v2_url(photo_link)})"
-                expire_seconds = 600
-                caption = (
-                    f"{linked_title}{_escape_md_v2(channel_handle)}"
-                    f"{_escape_md_v2('𝖳𝗁𝗂𝗌 𝗅𝗂𝗇𝗄 𝗐𝗂𝗅𝗅 𝖾𝗑𝗉𝗂𝗋𝖾 𝗂𝗇 ')}{_escape_md_v2(str(expire_seconds))}"
-                    f"{_escape_md_v2(' seconds.')}"
+                return await message.reply_text(
+                    "<b><blockquote expandable>Invalid or expired invite link.</b>",
+                    parse_mode=ParseMode.HTML
                 )
+
+            # Check if this is a /genlink link (original_link exists)
+            from database.database import get_original_link
+            original_link = await get_original_link(channel_id)
+            if original_link:
+                button = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("• Proceed to Link •", url=original_link)]]
+                )
+                return await message.reply_text(
+                    "<b><blockquote expandable>ʜᴇʀᴇ ɪs ʏᴏᴜʀ ʟɪɴᴋ! ᴄʟɪᴄᴋ ʙᴇʟᴏᴡ ᴛᴏ ᴘʀᴏᴄᴇᴇᴅ</b>",
+                    reply_markup=button,
+                    parse_mode=ParseMode.HTML
+                )
+
+            old_link_info = await get_current_invite_link(channel_id)
+            if old_link_info:
                 try:
-                    await message.reply_photo(
-                        photo=photo_link,
-                        caption=caption,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        reply_markup=button
-                    )
+                    await client.revoke_chat_invite_link(channel_id, old_link_info["invite_link"])
+                    print(f"Revoked old {'request' if old_link_info['is_request'] else 'invite'} link for channel {channel_id}")
                 except Exception as e:
-                    print(f"[start] send_photo markdown failed: {e}")
-                    fallback_caption = f"Title'- {channel_handle} This link will expire in 600 seconds."
-                    await message.reply_photo(
-                        photo=photo_link,
-                        caption=fallback_caption,
-                        reply_markup=button
-                    )
-            else:
-                # Fallback to previous text behavior
-                await message.reply_text("Here is your link! Click below to proceed:", reply_markup=button)
+                    print(f"Failed to revoke old link for channel {channel_id}: {e}")
+
+            invite = await client.create_chat_invite_link(
+                chat_id=channel_id,
+                expire_date=datetime.now() + timedelta(minutes=5),
+                creates_join_request=is_request
+            )
+
+            await save_invite_link(channel_id, invite.invite_link, is_request)
+
+            button_text = "• ʀᴇǫᴜᴇsᴛ ᴛᴏ ᴊᴏɪɴ •" if is_request else "• ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ •"
+            button = InlineKeyboardMarkup([[InlineKeyboardButton(button_text, url=invite.invite_link)]])
+
+            wait_msg = await message.reply_text(
+                "<b>Please wait...</b>",
+                parse_mode=ParseMode.HTML
+            )
+            
+            await asyncio.sleep(0.5)
+            
+            await wait_msg.delete()
+            
+            await message.reply_text(
+                "<b><blockquote expandable>ʜᴇʀᴇ ɪs ʏᴏᴜʀ ʟɪɴᴋ! ᴄʟɪᴄᴋ ʙᴇʟᴏᴡ ᴛᴏ ᴘʀᴏᴄᴇᴇᴅ</b>",
+                reply_markup=button,
+                parse_mode=ParseMode.HTML
+            )
+
+            note_msg = await message.reply_text(
+                "<u><b>Note: If the link is expired, please click the post link again to get a new one.</b></u>",
+                parse_mode=ParseMode.HTML
+            )
+
+            # Auto-delete the note message after 5 minutes
+            asyncio.create_task(delete_after_delay(note_msg, 300))
+
+            asyncio.create_task(revoke_invite_after_5_minutes(client, channel_id, invite.invite_link, is_request))
 
         except Exception as e:
-            # Ensure placeholder is removed on errors to avoid clutter
-            if placeholder:
-                try: await placeholder.delete()
-                except Exception: pass
-            await message.reply_text("⚠️ Invalid or expired link.")
+            await message.reply_text(
+                "<b><blockquote expandable>Invalid or expired invite link.</b>",
+                parse_mode=ParseMode.HTML
+            )
             print(f"Decoding error: {e}")
     else:
-        # Remove any stray placeholder in no-payload branch
-        if placeholder:
-            try: await placeholder.delete()
-            except Exception: pass
         inline_buttons = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("About Me", callback_data="help"),
-                 InlineKeyboardButton("Close", callback_data="close")]
+                [InlineKeyboardButton("• ᴀʙᴏᴜᴛ", callback_data="about"),
+                 InlineKeyboardButton("• ᴄʜᴀɴɴᴇʟs", callback_data="channels")],
+                [InlineKeyboardButton("• Close •", callback_data="close")]
             ]
         )
         
-        await message.reply_text(
-            "<b><i>Welcome to the advanced links sharing bot.\nWith this bot, you can share links and keep your channels safe from copyright issues</i></b>",
-            reply_markup=inline_buttons
+        try:
+            await message.reply_photo(
+                photo=START_PIC,
+                caption=START_MSG,
+                reply_markup=inline_buttons,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            print(f"Error sending start picture: {e}")
+            await message.reply_text(
+                START_MSG,
+                reply_markup=inline_buttons,
+                parse_mode=ParseMode.HTML
+            )
+
+
+#=====================================================================================##
+# Don't Remove Credit @CodeFlix_Bots, @rohit_1888
+# Ask Doubt on telegram @CodeflixSupport
+
+#=====================================================================================##
+
+
+# Remove or comment out the old about/help callback handlers to avoid conflicts
+# @Bot.on_callback_query(filters.regex("help"))
+# async def help_callback(client: Bot, callback_query):
+#     inline_buttons = InlineKeyboardMarkup(
+#         [
+#             [InlineKeyboardButton("• ᴄʟᴏsᴇ", callback_data="close")],
+#             InlineKeyboardButton("ʜᴏᴍᴇ •", callback_data="home")],
+#         ]
+#     )
+
+#     await callback_query.answer()
+#     current_text = callback_query.message.text.html if callback_query.message.text else ""
+#     if current_text != CHANNELS_TXT or callback_query.message.reply_markup != inline_buttons:
+#         try:
+#             await callback_query.message.edit_text(
+#                 CHANNELS_TXT,
+#                 reply_markup=inline_buttons,
+#                 parse_mode=ParseMode.HTML
+#             )
+#         except Exception as e:
+#             print(f"Error editing help message: {e}")
+#     else:
+#         print("Skipped edit: Message content unchanged")
+
+# @Bot.on_callback_query(filters.regex("about"))
+# async def about_callback(client: Bot, callback_query):
+#     inline_buttons = InlineKeyboardMarkup(
+#         [
+#             [InlineKeyboardButton("• ᴄʟᴏsᴇ", callback_data="close")],
+#             InlineKeyboardButton("ʜᴏᴍᴇ •", callback_data="home")],
+#         ]
+#     )
+
+#     await callback_query.answer()
+#     current_text = callback_query.message.text.html if callback_query.message.text else ""
+#     if current_text != ABOUT or callback_query.message.reply_markup != inline_buttons:
+#         try:
+#             await callback_query.message.edit_text(
+#                 ABOUT,
+#                 reply_markup=inline_buttons,
+#                 parse_mode=ParseMode.HTML
+#             )
+#         except Exception as e:
+#             print(f"Error editing about message: {e}")
+#     else:
+#         print("Skipped edit: Message content unchanged")
+
+@Bot.on_callback_query(filters.regex("close"))
+async def close_callback(client: Bot, callback_query):
+    await callback_query.answer()
+    await callback_query.message.delete()
+
+@Bot.on_callback_query(filters.regex("check_sub"))
+async def check_sub_callback(client: Bot, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    fsub_channels = await get_fsub_channels()
+    
+    if not fsub_channels:
+        await callback_query.message.edit_text(
+            "<b>No FSub channels configured!</b>",
+            parse_mode=ParseMode.HTML
         )
-        
-#=====================================================================================##
-
-WAIT_MSG = """"<b>Processing ....</b>"""
-
-REPLY_ERROR = """<code>Use this command as a reply to any telegram message with out any spaces.</code>"""
-
-#=====================================================================================##
-
-@Client.on_message(filters.command('users') & filters.user(OWNER_ID))
-async def get_users(client: Client, message: Message):
-    user_id = message.from_user.id
-    if user_id != OWNER_ID:
         return
-    msg = await client.send_message(chat_id=message.chat.id, text=WAIT_MSG)
+    
+    is_subscribed, subscription_message, subscription_buttons = await check_subscription_status(client, user_id, fsub_channels)
+    if is_subscribed:
+        await callback_query.message.edit_text(
+            "<b>You are subscribed to all required channels! Use /start to proceed.</b>",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await callback_query.message.edit_text(
+            subscription_message,
+            reply_markup=subscription_buttons,
+            parse_mode=ParseMode.HTML
+        )
+
+WAIT_MSG = "<b>Processing...</b>"
+
+REPLY_ERROR = "<code>Use this command as a reply to any Telegram message without any spaces.</code>"
+
+@Bot.on_message(filters.command('status') & filters.private & is_owner_or_admin)
+async def info(client: Bot, message: Message):   
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("• Close •", callback_data="close")]])
+    
+    start_time = time.time()
+    temp_msg = await message.reply("<b><i>Processing...</i></b>", quote=True, parse_mode=ParseMode.HTML)
+    end_time = time.time()
+    
+    ping_time = (end_time - start_time) * 1000
+    
     users = await full_userbase()
-    await msg.edit(f"{len(users)} users are using this bot")
+    now = datetime.now()
+    delta = now - client.uptime
+    bottime = get_readable_time(delta.seconds)
+    
+    await temp_msg.edit(
+        f"<b>Users: {len(users)}\n\nUptime: {bottime}\n\nPing: {ping_time:.2f} ms</b>",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
 
+@Bot.on_message(filters.command('broadcast') & filters.private & is_owner_or_admin)
+async def send_text(client: Bot, message: Message):
+    global is_canceled
+    async with cancel_lock:
+        is_canceled = False
+    mode = False
+    broad_mode = ''
+    store = message.text.split()[1:]
+    
+    if store and len(store) == 1 and store[0] == 'silent':
+        mode = True
+        broad_mode = 'Silent '
 
-#=====================================================================================##
-
-@Client.on_message(filters.private & filters.command('broadcast') & filters.user(OWNER_ID))
-async def send_text(client: Client, message: Message):
     if message.reply_to_message:
         query = await full_userbase()
         broadcast_msg = message.reply_to_message
-        total = 0
+        total = len(query)
         successful = 0
         blocked = 0
         deleted = 0
         unsuccessful = 0
 
-        pls_wait = await message.reply("<i>Broadcasting Message.. This will Take Some Time </i>")
-        for chat_id in query:
+        pls_wait = await message.reply("<i>Broadcasting message... This will take some time.</i>", parse_mode=ParseMode.HTML)
+        bar_length = 20
+        final_progress_bar = "●" * bar_length
+        complete_msg = f"🤖 {broad_mode}Broadcast Completed ✅"
+        progress_bar = ''
+        last_update_percentage = 0
+        percent_complete = 0
+        update_interval = 0.05
+
+        for i, chat_id in enumerate(query, start=1):
+            async with cancel_lock:
+                if is_canceled:
+                    final_progress_bar = progress_bar
+                    complete_msg = f"🤖 {broad_mode}Broadcast Canceled ❌"
+                    break
             try:
-                await broadcast_msg.copy(chat_id)
+                await broadcast_msg.copy(chat_id, disable_notification=mode)
                 successful += 1
             except FloodWait as e:
-                await asyncio.sleep(e.x)
-                await broadcast_msg.copy(chat_id)
+                await asyncio.sleep(e.value)
+                await broadcast_msg.copy(chat_id, disable_notification=mode)
                 successful += 1
             except UserIsBlocked:
                 await del_user(chat_id)
@@ -249,80 +313,153 @@ async def send_text(client: Client, message: Message):
                 deleted += 1
             except:
                 unsuccessful += 1
-                pass
-            total += 1
 
-        status = f"""<b><u>Broadcast Completed</u>
+            percent_complete = i / total
 
-Total Users: <code>{total}</code>
-Successful: <code>{successful}</code>
-Blocked Users: <code>{blocked}</code>
-Deleted Accounts: <code>{deleted}</code>
-Unsuccessful: <code>{unsuccessful}</code></b>"""
+            if percent_complete - last_update_percentage >= update_interval or last_update_percentage == 0:
+                num_blocks = int(percent_complete * bar_length)
+                progress_bar = "●" * num_blocks + "○" * (bar_length - num_blocks)
+    
+                status_update = f"""<b>🤖 {broad_mode}Broadcast in Progress...
 
-        return await pls_wait.edit(status)
+Progress: [{progress_bar}] {percent_complete:.0%}
+
+Total Users: {total}
+Successful: {successful}
+Blocked Users: {blocked}
+Deleted Accounts: {deleted}
+Unsuccessful: {unsuccessful}</b>
+
+<i>To stop the broadcast, use: /cancel</i>"""
+                await pls_wait.edit(status_update, parse_mode=ParseMode.HTML)
+                last_update_percentage = percent_complete
+
+        final_status = f"""<b>{complete_msg}
+
+Progress: [{final_progress_bar}] {percent_complete:.0%}
+
+Total Users: {total}
+Successful: {successful}
+Blocked Users: {blocked}
+Deleted Accounts: {deleted}
+Unsuccessful: {unsuccessful}</b>"""
+        return await pls_wait.edit(final_status, parse_mode=ParseMode.HTML)
 
     else:
-        msg = await message.reply(REPLY_ERROR)
+        msg = await message.reply(REPLY_ERROR, parse_mode=ParseMode.HTML)
         await asyncio.sleep(8)
         await msg.delete()
-
-#=====================================================================================##
-
-@Client.on_callback_query(filters.regex("help"))
-async def help_callback(client: Client, callback_query):
-    # Define the inline keyboard with the "Close" button
-    inline_buttons = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Close", callback_data="close")]
-        ]
-    )
-    
-    
-    await callback_query.answer()
-    await callback_query.message.edit_text("<b><i>About Us..\n\n‣ Made for : @Anime_X_Hunters\n‣ Owned by : @Okabe_xRintarou\n‣ Developer : @The_Seishiro_Nagi\n\n Adios !!</i></b>", reply_markup=inline_buttons)
-
-@Client.on_callback_query(filters.regex("close"))
-async def close_callback(client: Client, callback_query):
-    await callback_query.answer()
-    await callback_query.message.delete()
-
-#=====================================================================================##
-
 
 user_message_count = {}
 user_banned_until = {}
 
 MAX_MESSAGES = 3
-TIME_WINDOW = timedelta(seconds=10)  # Capturing frames
-BAN_DURATION = timedelta(hours=1)  # User ko ban rakhne ka time. hours ko minutes karlena
+TIME_WINDOW = timedelta(seconds=10)
+BAN_DURATION = timedelta(hours=1)
 
-@Client.on_message(filters.private)
-async def monitor_messages(client: Client, message: Message):
+"""
+
+@Bot.on_message(filters.private)
+async def monitor_messages(client: Bot, message: Message):
     user_id = message.from_user.id
     now = datetime.now()
+
+    if message.text and message.text.startswith("/"):
+        return
 
     if user_id in ADMINS:
         return 
 
-    
     if user_id in user_banned_until and now < user_banned_until[user_id]:
-        await message.reply_text("⚠️ You are temporarily banned from using commands due to spamming. Try again later.")
+        await message.reply_text(
+            "<b><blockquote expandable>You are temporarily banned from using commands due to spamming. Try again later.</b>",
+            parse_mode=ParseMode.HTML
+        )
         return
 
     if user_id not in user_message_count:
         user_message_count[user_id] = []
 
     user_message_count[user_id].append(now)
-
     user_message_count[user_id] = [time for time in user_message_count[user_id] if now - time <= TIME_WINDOW]
 
     if len(user_message_count[user_id]) > MAX_MESSAGES:
         user_banned_until[user_id] = now + BAN_DURATION
-        await message.reply_text("🚫 You have been temporarily banned for spamming. Try again in 1 hour.")
+        await message.reply_text(
+            "<b><blockquote expandable>You are temporarily banned from using commands due to spamming. Try again later.</b>",
+            parse_mode=ParseMode.HTML
+        )
         return
 
-# Function to get channels (dummy implementation)
-async def get_channels():
-    # This should be replaced with actual logic to fetch channels
-    return [123456789, 987654321]
+"""
+
+@Bot.on_callback_query()
+async def cb_handler(client: Bot, query: CallbackQuery):
+    data = query.data  
+    chat_id = query.message.chat.id
+    
+    if data == "close":
+        await query.message.delete()
+        try:
+            await query.message.reply_to_message.delete()
+        except:
+            pass
+    
+    elif data == "about":
+        user = await client.get_users(OWNER_ID)
+        user_link = f"https://t.me/{user.username}" if user.username else f"tg://openmessage?user_id={OWNER_ID}"
+        
+        await query.edit_message_media(
+            InputMediaPhoto(
+                "https://envs.sh/Wdj.jpg",
+                ABOUT_TXT
+            ),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('• ʙᴀᴄᴋ', callback_data='start'), InlineKeyboardButton('ᴄʟᴏsᴇ •', callback_data='close')]
+            ]),
+        )
+
+    elif data == "channels":
+        user = await client.get_users(OWNER_ID)
+        user_link = f"https://t.me/{user.username}" if user.username else f"tg://openmessage?user_id={OWNER_ID}" 
+        ownername = f"<a href={user_link}>{user.first_name}</a>" if user.first_name else f"<a href={user_link}>no name !</a>"
+        await query.edit_message_media(
+            InputMediaPhoto("https://envs.sh/Wdj.jpg", 
+                            CHANNELS_TXT
+            ),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('• ʙᴀᴄᴋ', callback_data='start'), InlineKeyboardButton('home•', callback_data='setting')]
+            ]),
+        )
+    elif data in ["start", "home"]:
+        inline_buttons = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("• ᴀʙᴏᴜᴛ", callback_data="about"),
+                 InlineKeyboardButton("• ᴄʜᴀɴɴᴇʟs", callback_data="channels")],
+                [InlineKeyboardButton("• Close •", callback_data="close")]
+            ]
+        )
+        try:
+            await query.edit_message_media(
+                InputMediaPhoto(
+                    START_PIC,
+                    START_MSG
+                ),
+                reply_markup=inline_buttons
+            )
+        except Exception as e:
+            print(f"Error sending start/home photo: {e}")
+            await query.edit_message_text(
+                START_MSG,
+                reply_markup=inline_buttons,
+                parse_mode=ParseMode.HTML
+            )
+
+def delete_after_delay(msg, delay):
+    async def inner():
+        await asyncio.sleep(delay)
+        try:
+            await msg.delete()
+        except:
+            pass
+    return inner()
